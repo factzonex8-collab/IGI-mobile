@@ -15,6 +15,7 @@ import android.view.WindowManager
 import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
 import android.webkit.PermissionRequest
+import android.webkit.ServiceWorkerController
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -46,13 +47,13 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.SignalWifiOff
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedButton
@@ -86,11 +87,23 @@ import com.example.ui.theme.TacticalGreen
 import com.example.ui.theme.TacticalSurface
 import com.example.ui.theme.TacticalSurfaceVariant
 import com.example.ui.theme.TextMuted
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
-private const val PREFS_NAME = "igi_mobile_prefs"
-private const val KEY_LAUNCH_COUNT = "launch_count"
-private const val URL_DOWNLOAD = "https://playigi.com/download.html"
-private const val URL_GAME = "https://playigi.com/game/?touch=1"
+const val URL_GAME = "https://playigi.com/game/?touch=1"
+const val URL_DOWNLOAD = "https://playigi.com/download.html"
+
+/**
+ * Checks active internet connectivity.
+ */
+fun isNetworkAvailable(context: Context): Boolean {
+    val connectivityManager =
+        context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
+    val activeNetwork = connectivityManager.activeNetwork ?: return false
+    val networkCapabilities =
+        connectivityManager.getNetworkCapabilities(activeNetwork) ?: return false
+    return networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+}
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
@@ -98,15 +111,9 @@ fun IgiMobileScreen() {
     val context = LocalContext.current
     val activity = context as? Activity
 
-    // Determine initial target URL based on launch count
-    val prefs = remember { context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) }
-    var currentUrl by remember {
-        val launchCount = prefs.getInt(KEY_LAUNCH_COUNT, 0)
-        val initialUrl = if (launchCount == 0) URL_DOWNLOAD else URL_GAME
-        // Update launch count
-        prefs.edit().putInt(KEY_LAUNCH_COUNT, launchCount + 1).apply()
-        mutableStateOf(initialUrl)
-    }
+    // Target URL is now directly the game URL
+    var currentUrl by remember { mutableStateOf(URL_GAME) }
+    var isOfflineMode by remember { mutableStateOf(!isNetworkAvailable(context)) }
 
     var webViewInstance by remember { mutableStateOf<WebView?>(null) }
     var isLoading by remember { mutableStateOf(true) }
@@ -116,6 +123,47 @@ fun IgiMobileScreen() {
     var showExitDialog by remember { mutableStateOf(false) }
     var customView by remember { mutableStateOf<View?>(null) }
     var customViewCallback by remember { mutableStateOf<WebChromeClient.CustomViewCallback?>(null) }
+
+    // Configure ServiceWorker caching for modern WebAssembly/PWA assets
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            try {
+                val swController = ServiceWorkerController.getInstance()
+                swController.serviceWorkerWebSettings.cacheMode = WebSettings.LOAD_CACHE_ELSE_NETWORK
+                swController.serviceWorkerWebSettings.allowContentAccess = true
+                swController.serviceWorkerWebSettings.allowFileAccess = true
+            } catch (_: Exception) {
+                // Not supported on all custom vendor ROMs
+            }
+        }
+
+        // Background Preloader: Pre-fetch download page assets and caches in the background
+        if (isNetworkAvailable(context)) {
+            try {
+                withContext(Dispatchers.Main) {
+                    val preloader = WebView(context.applicationContext).apply {
+                        settings.apply {
+                            javaScriptEnabled = true
+                            domStorageEnabled = true
+                            databaseEnabled = true
+                            allowFileAccess = true
+                            allowContentAccess = true
+                            cacheMode = WebSettings.LOAD_DEFAULT
+                            mediaPlaybackRequiresUserGesture = true // Silent preloader
+                        }
+                        webViewClient = object : WebViewClient() {
+                            override fun onPageFinished(view: WebView?, url: String?) {
+                                // Background preloading completed
+                            }
+                        }
+                        loadUrl(URL_DOWNLOAD)
+                    }
+                }
+            } catch (_: Exception) {
+                // Ignore background preload errors
+            }
+        }
+    }
 
     // Intercept back button to avoid accidental exits during gameplay
     BackHandler {
@@ -161,12 +209,12 @@ fun IgiMobileScreen() {
                     isFocusableInTouchMode = true
                     setLayerType(View.LAYER_TYPE_HARDWARE, null)
 
-                    // Cookie setup
+                    // Enable cookies
                     val cookieManager = CookieManager.getInstance()
                     cookieManager.setAcceptCookie(true)
                     cookieManager.setAcceptThirdPartyCookies(this, true)
 
-                    // WebSettings tailored for WebAssembly & 3D WebGL HTML5 games
+                    // WebSettings tailored for WebAssembly, 3D WebGL, and aggressive Offline Caching
                     settings.apply {
                         javaScriptEnabled = true
                         domStorageEnabled = true
@@ -177,22 +225,27 @@ fun IgiMobileScreen() {
                         loadsImagesAutomatically = true
                         useWideViewPort = true
                         loadWithOverviewMode = true
-                        cacheMode = WebSettings.LOAD_DEFAULT
                         mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+
+                        // Offline caching: use cached files if available, otherwise fetch from network
+                        cacheMode = if (isNetworkAvailable(ctx)) {
+                            WebSettings.LOAD_DEFAULT
+                        } else {
+                            WebSettings.LOAD_CACHE_ELSE_NETWORK
+                        }
 
                         // Disable zoom controls to prevent multi-touch interference with game touch joystick
                         setSupportZoom(false)
                         builtInZoomControls = false
                         displayZoomControls = false
 
-                        // Performance & viewport
                         defaultTextEncodingName = "utf-8"
                     }
 
                     webChromeClient = object : WebChromeClient() {
                         override fun onProgressChanged(view: WebView?, newProgress: Int) {
                             loadProgress = newProgress
-                            if (newProgress >= 95) {
+                            if (newProgress >= 90) {
                                 isLoading = false
                             }
                         }
@@ -227,7 +280,7 @@ fun IgiMobileScreen() {
                             if (url.startsWith("http://") || url.startsWith("https://")) {
                                 return false // Load internally
                             }
-                            // External protocols (tel, mailto, etc.)
+                            // External protocols
                             return try {
                                 val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
                                 ctx.startActivity(intent)
@@ -244,6 +297,7 @@ fun IgiMobileScreen() {
 
                         override fun onPageFinished(view: WebView?, url: String?) {
                             isLoading = false
+                            hasError = false
                         }
 
                         override fun onReceivedError(
@@ -252,8 +306,15 @@ fun IgiMobileScreen() {
                             error: WebResourceError?
                         ) {
                             if (request?.isForMainFrame == true) {
+                                // If online network failed, try loading from local cache
+                                if (settings.cacheMode != WebSettings.LOAD_CACHE_ONLY) {
+                                    settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
+                                    loadUrl(currentUrl)
+                                    return
+                                }
                                 hasError = true
-                                errorMessage = error?.description?.toString() ?: "Network Connection Error"
+                                isOfflineMode = true
+                                errorMessage = error?.description?.toString() ?: "Network Error"
                                 isLoading = false
                             }
                         }
@@ -332,10 +393,10 @@ fun IgiMobileScreen() {
                     Spacer(modifier = Modifier.height(6.dp))
 
                     Text(
-                        text = if (currentUrl.contains("download")) {
-                            "DOWNLOADING GAME PROTOCOLS & ASSETS..."
+                        text = if (isOfflineMode) {
+                            "OFFLINE MODE // LOADING CACHED WEBASSEMBLY ENGINE"
                         } else {
-                            "STARTING WEBASSEMBLY ENGINE // TACTICAL MISSION"
+                            "PRELOADING GAME ASSETS // WEBASSEMBLY ENGINE"
                         },
                         color = TextMuted,
                         fontSize = 12.sp,
@@ -390,8 +451,8 @@ fun IgiMobileScreen() {
                         modifier = Modifier.padding(24.dp)
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Warning,
-                            contentDescription = "Connection Alert",
+                            imageVector = Icons.Default.SignalWifiOff,
+                            contentDescription = "Offline Alert",
                             tint = AlertRed,
                             modifier = Modifier.size(44.dp)
                         )
@@ -399,7 +460,7 @@ fun IgiMobileScreen() {
                         Spacer(modifier = Modifier.height(12.dp))
 
                         Text(
-                            text = "COMMUNICATION SIGNAL LOST",
+                            text = "OFFLINE - ASSETS NOT CACHED YET",
                             color = AlertRed,
                             fontSize = 18.sp,
                             fontWeight = FontWeight.Bold,
@@ -409,7 +470,7 @@ fun IgiMobileScreen() {
                         Spacer(modifier = Modifier.height(8.dp))
 
                         Text(
-                            text = "Unable to connect to IGI servers. Check your internet connection and try again.",
+                            text = "Please connect to the internet once to download and cache the IGI game files. After the first load, the game can be played completely offline!",
                             color = TextMuted,
                             fontSize = 13.sp,
                             textAlign = TextAlign.Center
@@ -424,7 +485,15 @@ fun IgiMobileScreen() {
                                 onClick = {
                                     hasError = false
                                     isLoading = true
-                                    webViewInstance?.reload()
+                                    val webView = webViewInstance
+                                    if (webView != null) {
+                                        webView.settings.cacheMode = if (isNetworkAvailable(context)) {
+                                            WebSettings.LOAD_DEFAULT
+                                        } else {
+                                            WebSettings.LOAD_CACHE_ELSE_NETWORK
+                                        }
+                                        webView.loadUrl(currentUrl)
+                                    }
                                 },
                                 colors = ButtonDefaults.buttonColors(containerColor = TacticalGreen),
                                 shape = RoundedCornerShape(8.dp),
@@ -438,7 +507,7 @@ fun IgiMobileScreen() {
                                 )
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Text(
-                                    "RECONNECT",
+                                    "RECONNECT & DOWNLOAD",
                                     color = Color.Black,
                                     fontWeight = FontWeight.Bold,
                                     fontFamily = FontFamily.Monospace
@@ -449,16 +518,16 @@ fun IgiMobileScreen() {
                                 onClick = {
                                     hasError = false
                                     isLoading = true
-                                    val nextUrl = if (currentUrl == URL_DOWNLOAD) URL_GAME else URL_DOWNLOAD
-                                    currentUrl = nextUrl
-                                    webViewInstance?.loadUrl(nextUrl)
+                                    val webView = webViewInstance
+                                    webView?.settings?.cacheMode = WebSettings.LOAD_CACHE_ONLY
+                                    webView?.loadUrl(currentUrl)
                                 },
                                 shape = RoundedCornerShape(8.dp),
                                 colors = ButtonDefaults.outlinedButtonColors(contentColor = TacticalGreen),
-                                modifier = Modifier.testTag("switch_mode_button")
+                                modifier = Modifier.testTag("try_cache_button")
                             ) {
                                 Text(
-                                    if (currentUrl == URL_DOWNLOAD) "OPEN GAME DIRECTLY" else "OPEN DOWNLOAD PAGE",
+                                    "TRY OFFLINE CACHE",
                                     fontFamily = FontFamily.Monospace,
                                     fontSize = 12.sp
                                 )
