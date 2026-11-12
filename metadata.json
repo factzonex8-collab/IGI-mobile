@@ -1,0 +1,6 @@
+{
+  "name": "IGI MOBILE",
+  "description": "Play IGI in immersive landscape full-screen with WebAssembly game acceleration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
